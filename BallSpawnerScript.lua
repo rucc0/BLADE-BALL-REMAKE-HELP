@@ -54,7 +54,7 @@ local BALL_SIZE = 3
 local MIN_PLAYERS_TO_SPAWN = 2
 
 local settings = {
-	baseSpeed = 1,
+	baseSpeed = 30,
 	maxBallSpeed = math.huge,
 	speedIncrease = 6,
 }
@@ -354,12 +354,23 @@ local lastParryAttempt = {}
 local parryBlockedUntil = {}
 local playerDesiredTarget = {}
 local playerFlickDirection = {}
-local playerCurveIntensity = {}
 
 local SHIELD_ICON_ID = "rbxassetid://395920626"
 local SHIELD_ICON_OFFSET = 0
+local activeShieldIcons = {}
+
+local function closeParryShieldIcon(player)
+	local entry = activeShieldIcons[player]
+	if not entry then return end
+	activeShieldIcons[player] = nil
+	if entry.shield.Parent then
+		entry.shield:Destroy()
+	end
+end
 
 local function spawnParryShieldIcon(player)
+	closeParryShieldIcon(player)
+
 	local char = player.Character
 	local hrp = char and char:FindFirstChild("HumanoidRootPart")
 	if not hrp then return end
@@ -399,22 +410,30 @@ local function spawnParryShieldIcon(player)
 	icon.ImageTransparency = 0
 	icon.Parent = billboard
 
-	local tweenInfo = TweenInfo.new(WHIFF_COOLDOWN, Enum.EasingStyle.Linear)
+	-- Tied directly to the parry window: fades across exactly PARRY_WINDOW,
+	-- and gets closed out early (see closeParryShieldIcon) the instant the
+	-- window actually ends, whether that's a timeout or a successful parry.
+	local tweenInfo = TweenInfo.new(PARRY_WINDOW, Enum.EasingStyle.Linear)
 	TweenService:Create(icon, tweenInfo, {ImageTransparency = 1}):Play()
 
-	task.delay(WHIFF_COOLDOWN, function()
-		shield:Destroy()
+	local entry = {shield = shield}
+	activeShieldIcons[player] = entry
+
+	task.delay(PARRY_WINDOW, function()
+		if activeShieldIcons[player] == entry then
+			activeShieldIcons[player] = nil
+		end
+		if shield.Parent then
+			shield:Destroy()
+		end
 	end)
 end
 
-local FLICK_CURVE_STRENGTH_LOW_SPEED = 2000
-local FLICK_CURVE_STRENGTH_LOW_VALUE = 1.4
-local FLICK_CURVE_STRENGTH_HIGH_SPEED = 3000
-local FLICK_CURVE_STRENGTH_HIGH_VALUE = 3.4
-
-local NORMAL_STEER = 18
-local CURVE_DECAY_FAST = 3.2
-local CURVE_DECAY_SLOW = 0.55
+-- Curve is simple by design: a parry just snaps the ball's velocity to face
+-- wherever the player was looking/flicking at that instant. From there it
+-- homes back toward its target automatically (steer rate derived from
+-- distance/speed each frame), which is what gives the arc its curved shape.
+-- No tuning constants.
 
 local AUTO_PARRY_USERNAMES = {
 	"",
@@ -714,8 +733,6 @@ local function spawnBall(ballId, onDespawn)
 
 	local parryCount = 0
 	local homingVelocity = Vector3.zero
-	local curveImpulse = Vector3.zero
-	local curveDecayRate = CURVE_DECAY_FAST
 	local smoothedFloorY = nil
 	local alive = true
 	local lastSegStart, lastSegEnd = ball.Position, ball.Position
@@ -767,32 +784,39 @@ local function spawnBall(ballId, onDespawn)
 			lastParryAttempt[parriedBy] = nil
 			playerParryWindowEnd[parriedBy] = nil
 			parryBlockedUntil[parriedBy] = nil
+			closeParryShieldIcon(parriedBy)
 		end
 
 		local desired = parriedBy and playerDesiredTarget[parriedBy]
 		local hasDirectRedirect = desired and desired ~= parriedBy and isTargetable(desired)
 		local flickDirection = parriedBy and playerFlickDirection[parriedBy]
 
+		local newTarget = hasDirectRedirect and desired or pickRandomTarget(parriedBy)
+		applyTarget(newTarget)
+
 		setSpeed(getSpeed() + 1)
 		if flickDirection then
-			local curveIntensity = (parriedBy and playerCurveIntensity[parriedBy]) or 0
-			local speedAlpha = math.clamp(
-				(getSpeed() - FLICK_CURVE_STRENGTH_LOW_SPEED) / (FLICK_CURVE_STRENGTH_HIGH_SPEED - FLICK_CURVE_STRENGTH_LOW_SPEED),
-				0, 1
-			)
-			local strengthAlpha = math.clamp(speedAlpha * (0.5 + 0.5 * curveIntensity), 0, 1)
-			local curveStrength = FLICK_CURVE_STRENGTH_LOW_VALUE + (FLICK_CURVE_STRENGTH_HIGH_VALUE - FLICK_CURVE_STRENGTH_LOW_VALUE) * strengthAlpha
-			curveImpulse = flickDirection * getSpeed() * curveStrength
-			curveDecayRate = CURVE_DECAY_FAST + (CURVE_DECAY_SLOW - CURVE_DECAY_FAST) * curveIntensity
+			-- Snap straight to the direction the player flicked/looked at the moment
+			-- of the parry. Homing steer then bends it back toward the target over
+			-- time (rate computed automatically per-frame), which is the actual "curve."
+			homingVelocity = flickDirection * getSpeed()
 		else
-			homingVelocity = Vector3.zero
-			curveImpulse = Vector3.zero
+			-- No flick (bot, or a plain parry with no camera movement): don't curve at
+			-- all -- point straight at the new target instantly. Curving is reserved
+			-- for actual flicks; anything else should just aim and go.
+			local newTargetChar = newTarget and newTarget.Character
+			local newTargetHrp = newTargetChar and newTargetChar:FindFirstChild("HumanoidRootPart")
+			if newTargetHrp then
+				local toNewTarget = newTargetHrp.Position - ball.Position
+				if toNewTarget.Magnitude > 0.001 then
+					homingVelocity = toNewTarget.Unit * getSpeed()
+				end
+			end
 		end
 		smoothedFloorY = nil
 
 		if parriedBy then
 			playerFlickDirection[parriedBy] = nil
-			playerCurveIntensity[parriedBy] = nil
 		end
 
 		if parriedBy and alive then
@@ -808,18 +832,11 @@ local function spawnBall(ballId, onDespawn)
 				playParryAnimation(parriedByChar)
 			end
 		end
-
-		if hasDirectRedirect then
-			applyTarget(desired)
-		else
-			applyTarget(pickRandomTarget(parriedBy))
-		end
 	end
 
 	local function bringBack()
 		ball.CFrame = CFrame.new(spawner.Position + Vector3.new(0, 15, 0))
 		homingVelocity = Vector3.zero
-		curveImpulse = Vector3.zero
 		smoothedFloorY = nil
 		lastSegStart, lastSegEnd = ball.Position, ball.Position
 		fireBallState({targetIsPlayer = currentTarget ~= nil, color = ball.Color, teleportTo = ball.Position})
@@ -827,7 +844,6 @@ local function spawnBall(ballId, onDespawn)
 
 	local function retargetIfCurrentlyTargeting(player)
 		if currentTarget == player then
-			curveImpulse = Vector3.zero
 			applyTarget(pickRandomTarget(player))
 		end
 	end
@@ -846,7 +862,6 @@ local function spawnBall(ballId, onDespawn)
 		local targetPos
 		if currentTarget then
 			if not isTargetable(currentTarget) then
-				curveImpulse = Vector3.zero
 				applyTarget(pickRandomTarget(currentTarget))
 			else
 				local currentHrp = currentTarget.Character:FindFirstChild("HumanoidRootPart")
@@ -863,13 +878,15 @@ local function spawnBall(ballId, onDespawn)
 
 			local desiredVelocity = forward * getSpeed()
 
-			local steerAlpha = 1 - math.exp(-NORMAL_STEER * dt)
+			-- Steer rate is derived automatically from the ball's own physics: how
+			-- long it would take to reach the target at its current speed. Close to
+			-- the target it turns sharply, far away it arcs gently -- no manual
+			-- tuning constant needed.
+			local timeToTarget = math.max(dist / math.max(getSpeed(), 1), 0.05)
+			local steerAlpha = 1 - math.exp(-dt / timeToTarget)
 			homingVelocity = homingVelocity:Lerp(desiredVelocity, steerAlpha)
 
-			local decayAlpha = 1 - math.exp(-curveDecayRate * dt)
-			curveImpulse = curveImpulse:Lerp(Vector3.zero, decayAlpha)
-
-			local currentVelocity = homingVelocity + curveImpulse
+			local currentVelocity = homingVelocity
 			local nextPos = prevBallPos + currentVelocity * dt
 
 			local rayParams = RaycastParams.new()
@@ -1068,7 +1085,6 @@ Players.PlayerRemoving:Connect(function(player)
 	parryBlockedUntil[player] = nil
 	playerDesiredTarget[player] = nil
 	playerFlickDirection[player] = nil
-	playerCurveIntensity[player] = nil
 	autoParryUserIds[player.UserId] = nil
 	for _, ctrl in activeBalls do
 		ctrl.retargetIfCurrentlyTargeting(player)
@@ -1147,12 +1163,6 @@ parryAttemptRemote.OnServerEvent:Connect(function(player, desiredTargetPlayer, f
 		playerFlickDirection[player] = nil
 	end
 
-	if typeof(curveIntensity) == "number" then
-		playerCurveIntensity[player] = math.clamp(curveIntensity, 0, 1)
-	else
-		playerCurveIntensity[player] = nil
-	end
-
 	task.delay(PARRY_WINDOW, function()
 		if playerParryWindowEnd[player] == thisWindowEnd then
 			playerParryWindowEnd[player] = nil
@@ -1169,16 +1179,11 @@ aimTargetRemote.OnServerEvent:Connect(function(player, aimedPlayer)
 	end
 end)
 
-autoParryFlickRemote.OnServerEvent:Connect(function(player, flickDirection, curveIntensity)
+autoParryFlickRemote.OnServerEvent:Connect(function(player, flickDirection)
 	if not hasAutoParry(player) then return end
 	if typeof(flickDirection) == "Vector3" and flickDirection.Magnitude > 0.001 then
 		playerFlickDirection[player] = flickDirection.Unit
 	else
 		playerFlickDirection[player] = nil
-	end
-	if typeof(curveIntensity) == "number" then
-		playerCurveIntensity[player] = math.clamp(curveIntensity, 0, 1)
-	else
-		playerCurveIntensity[player] = nil
 	end
 end)
